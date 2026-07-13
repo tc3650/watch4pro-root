@@ -121,8 +121,12 @@ int main() {
     printf("[+] result mapped: host=%p gpuaddr=0x%lx\n", result, (unsigned long)result_gpuaddr);
 
     /* Build GPU command buffer: do MEM_WRITE at offset 0x100 in result buffer */
-    uint32_t cmd[32];
-    memset(cmd, 0, sizeof(cmd));
+    uint32_t *cmd = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (cmd == MAP_FAILED) {
+        printf("[-] cmd mmap: %s\n", strerror(errno));
+        goto destroy;
+    }
+    memset(cmd, 0, 4096);
     uint32_t *p = cmd;
 
     uint64_t target_ga = result_gpuaddr + 0x100;
