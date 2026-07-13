@@ -189,6 +189,50 @@ int main() {
             printf("✅✅✅ MAP_SHARED: GPU MEM_WRITE CONFIRMED!\n");
         }
     }
+    
+    /* Test 3: Try with IOCOHERENT flag */
+    printf("\n[*] Retrying with IOCOHERENT flag...\n");
+    {
+        uint32_t *buf3 = mmap(NULL, 0x2000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (buf3 == MAP_FAILED) goto end;
+        memset(buf3, 0x42, 0x2000);
+        
+        uint64_t ga3 = 0;
+        struct kgsl_map_user_mem m3 = { .len = 0x2000, .hostptr = (unsigned long)buf3,
+            .memtype = KGSL_USER_MEM_TYPE_ADDR, .flags = 0x80000000 }; /* IOCOHERENT */
+        if (ioctl(fd, IOCTL_KGSL_MAP_USER_MEM, &m3)) {
+            printf("[-] map3 (IOCOHERENT): %s\n", strerror(errno));
+        } else {
+            ga3 = m3.gpuaddr;
+            printf("[+] buf3: cpu=%p gpu=0x%lx (IOCOHERENT)\n", buf3, (unsigned long)ga3);
+            
+            uint32_t *p3 = buf3;
+            *p3++ = CP_TYPE7_PKT(CP_WAIT_FOR_IDLE, 0);
+            *p3++ = CP_TYPE7_PKT(CP_MEM_WRITE, 3);
+            *p3++ = lower_32_bits(ga3 + 0x1000);
+            *p3++ = upper_32_bits(ga3 + 0x1000);
+            *p3++ = 0xCAFEBABE;
+            *p3++ = CP_TYPE7_PKT(CP_WAIT_MEM_WRITES, 0);
+            *p3++ = CP_TYPE7_PKT(CP_NOP, 0);
+            int cmd3_bytes = (char*)p3 - (char*)buf3;
+            
+            __builtin___clear_cache((char*)buf3, (char*)buf3 + 0x2000);
+            
+            struct kgsl_command_object obj3 = { .gpuaddr = ga3, .size = cmd3_bytes,
+                .flags = KGSL_CMDLIST_IB };
+            struct kgsl_gpu_command req3 = { .flags = KGSL_COMMAND_SYNC,
+                .cmdlist = (uint64_t)(unsigned long)&obj3, .cmdsize = sizeof(obj3), .numcmds = 1,
+                .context_id = ctx.drawctxt_id, .timestamp = 44 };
+            int r = ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &req3);
+            printf("submit3: %s ts=%u\n", r ? strerror(errno) : "OK", req3.timestamp);
+            if (!r) {
+                cache_invalidate(buf3 + 0x1000/4, 64);
+                printf("  buf3[0x1000/4]=0x%08x\n", buf3[0x1000/4]);
+                if (buf3[0x1000/4] == 0xCAFEBABE)
+                    printf("✅✅✅ IOCOHERENT WORKS!\n");
+            }
+        }
+    }
 
 end:
     { struct kgsl_drawctxt_destroy d = { .drawctxt_id = ctx.drawctxt_id };
