@@ -43,14 +43,23 @@ struct kgsl_command_object {
 #define upper_32_bits(n) ((uint32_t)(((n)>>16)>>16))
 #define lower_32_bits(n) ((uint32_t)(n))
 
-/* Force cache coherency via mprotect trick */
+/* Force cache coherency via mprotect trick, then try DC CIVAC inline asm */
 static inline void cache_invalidate(void *addr, size_t len) {
-    /* Align to page boundary */
+    /* First, try mprotect approach (always safe) */
     void *aligned = (void*)((uintptr_t)addr & ~0xFFF);
     size_t aligned_len = ((uintptr_t)addr + len + 0xFFF) & ~0xFFF;
     aligned_len -= (uintptr_t)aligned;
     mprotect(aligned, aligned_len, PROT_NONE);
     mprotect(aligned, aligned_len, PROT_READ|PROT_WRITE);
+    
+    /* Also try DC CIVAC on each cache line (from Mesa/Freedreno) */
+    /* dc civac = Clean and Invalidate data cache line by Virtual Address */
+    char *start = (char*)((uintptr_t)addr & ~31);
+    char *end = (char*)((uintptr_t)(addr + len + 31) & ~31);
+    for (char *p = start; p < end; p += 32) {
+        __asm volatile("mcr p15, 0, %0, c7, c14, 1" : : "r"(p) : "memory");
+    }
+    __asm volatile("dsb sy" : : : "memory");
 }
 
 int main() {
