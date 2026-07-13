@@ -44,14 +44,13 @@ struct kgsl_command_object {
 #define lo32(x) ((uint32_t)((x)&0xFFFFFFFF))
 #define hi32(x) ((uint32_t)(((x)>>16)>>16))
 
-/* Cache invalidate: DC CIVAC (from Mesa/Freedreno) */
-static inline void dc_civac(void *addr, int len) {
-    char *s = (char*)((uintptr_t)addr & ~31);
-    char *e = (char*)((uintptr_t)(addr + len + 31) & ~31);
-    for (char *p = s; p < e; p += 32) {
-        __asm volatile("mcr p15, 0, %0, c7, c14, 1" : : "r"(p) : "memory");
-    }
-    __asm volatile("dsb sy" : : : "memory");
+/* Use mprotect to force cache coherency (no DC CIVAC - blocked by kernel) */
+static inline void cache_sync(void *addr, int len) {
+    void *aligned = (void*)((uintptr_t)addr & ~0xFFF);
+    size_t aligned_len = ((uintptr_t)addr + len + 0xFFF) & ~0xFFF;
+    aligned_len -= (uintptr_t)aligned;
+    mprotect(aligned, aligned_len, PROT_NONE);
+    mprotect(aligned, aligned_len, PROT_READ|PROT_WRITE);
 }
 
 int main() {
@@ -120,7 +119,7 @@ int main() {
         
         if (!r) {
             /* Invalidate data cache before reading */
-            dc_civac((void*)dst, 8);
+            cache_sync((void*)dst, 8);
             printf("  src[0]=0x%08x src[1]=0x%08x\n", src[0], src[1]);
             printf("  dst[0]=0x%08x dst[1]=0x%08x\n", dst[0], dst[1]);
             if (dst[0] == 0x12345678)
@@ -157,7 +156,7 @@ int main() {
         printf("submit: %s ts=%u\n", r ? strerror(errno) : "OK", req.timestamp);
         
         if (!r) {
-            dc_civac((void*)dst, 4);
+            cache_sync((void*)dst, 4);
             printf("  dst[0]=0x%08x\n", dst[0]);
             if (dst[0] == 0xDEADBEEF)
                 printf("✅✅✅ CP_MEM_WRITE WORKS!\n");
@@ -187,7 +186,7 @@ int main() {
         
         printf("[*] polling dst for 10 seconds (DC CIVAC every 500ms)...\n");
         for (int i = 0; i < 20; i++) {
-            dc_civac((void*)dst, 8);
+            cache_sync((void*)dst, 8);
             if (dst[0] == 0x12345678) {
                 printf("  ✅ Found after %d polls!\n", i);
                 break;
