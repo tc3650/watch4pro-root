@@ -52,18 +52,6 @@ struct kgsl_command_object {
     unsigned int id;
 };
 
-struct kgsl_timestamp_event {
-    unsigned int type;      /* KGSL_TIMESTAMP_EVENT_TYPE */
-    unsigned int timestamp; /* timestamp to wait for */
-    unsigned int context_id;
-    int fd;                 /* for type=KGSL_TIMESTAMP_EVENT_SIGNAL */
-};
-
-struct kgsl_timestamp_event_retired {
-    unsigned int timestamp;
-    unsigned int reserved;
-};
-
 #define KGSL_USER_MEM_TYPE_ADDR 0x00000002
 #define KGSL_CMDLIST_IB 0x00000001U
 
@@ -71,7 +59,6 @@ struct kgsl_timestamp_event_retired {
 #define IOCTL_KGSL_DRAWCTXT_DESTROY   _IOW(KGSL_IOC_TYPE, 0x14, struct kgsl_drawctxt_destroy)
 #define IOCTL_KGSL_MAP_USER_MEM       _IOWR(KGSL_IOC_TYPE, 0x15, struct kgsl_map_user_mem)
 #define IOCTL_KGSL_GPU_COMMAND        _IOWR(KGSL_IOC_TYPE, 0x4A, struct kgsl_gpu_command)
-#define IOCTL_KGSL_TIMESTAMP_EVENT    _IOWR(KGSL_IOC_TYPE, 0x1A, struct kgsl_timestamp_event_retired)
 
 /* Adreno GPU packet helpers */
 #define CP_TYPE7_PKT(opcode, count) ((7 << 28) | ((opcode) << 16) | ((count) & 0x3FFF))
@@ -98,77 +85,78 @@ int main() {
     struct kgsl_drawctxt_create ctx = { .flags = 0x00001812 };
     if (ioctl(fd, IOCTL_KGSL_DRAWCTXT_CREATE, &ctx)) {
         printf("[-] ctx: %s\n", strerror(errno));
-        goto out;
+        goto out1;
     }
     printf("[+] ctx id=%u\n", ctx.drawctxt_id);
 
-    /* Allocate result buffer */
-    uint32_t *result = mmap(NULL, 0x10000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    memset(result, 0xAB, 0x10000);
-
-    uint64_t result_gpuaddr = 0;
-    {
-        struct kgsl_map_user_mem m = {
-            .len = 0x10000, .hostptr = (unsigned long)result,
-            .memtype = KGSL_USER_MEM_TYPE_ADDR,
-        };
-        if (ioctl(fd, IOCTL_KGSL_MAP_USER_MEM, &m)) {
-            printf("[-] map result: %s\n", strerror(errno));
-            goto destroy;
-        }
-        result_gpuaddr = m.gpuaddr;
+    /* == Allocate a single large buffer: commands at offset 0, result at offset 0x1000 == */
+    uint32_t *buf = mmap(NULL, 0x8000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) {
+        printf("[-] mmap buf: %s\n", strerror(errno));
+        goto out2;
     }
-    printf("[+] result mapped: host=%p gpuaddr=0x%lx\n", result, (unsigned long)result_gpuaddr);
-
-    /* Build GPU command buffer: do MEM_WRITE at offset 0x100 in result buffer */
-    uint32_t *cmd = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (cmd == MAP_FAILED) {
-        printf("[-] cmd mmap: %s\n", strerror(errno));
-        goto destroy;
-    }
-    memset(cmd, 0, 4096);
+    memset(buf, 0xAB, 0x8000);
+    
+    /* Command buffer at offset 0 */
+    uint32_t *cmd = buf;
     uint32_t *p = cmd;
-
-    uint64_t target_ga = result_gpuaddr + 0x100;
-
-    /* WAIT_FOR_IDLE first */
+    
+    uint64_t buf_gpuaddr = 0;
+    uint64_t cmd_gpuaddr = 0;  /* same as buf_gpuaddr */
+    uint64_t result_gpuaddr = 0; /* buf_gpuaddr + 0x1000 */
+    
+    /* Build GPU commands */
+    /* WAIT_FOR_IDLE */
     *p++ = CP_TYPE7_PKT(CP_WAIT_FOR_IDLE, 0);
-    /* MEM_WRITE: count=3 (addr_lo, addr_hi, value) */
+    /* MEM_WRITE to result_gpuaddr + 0x000 (completion marker) */
     *p++ = CP_TYPE7_PKT(CP_MEM_WRITE, 3);
-    p += cp_gpuaddr(p, target_ga);
-    *p++ = 0xDEADBEEF;
-    /* WAIT_MEM_WRITES to flush */
-    *p++ = CP_TYPE7_PKT(CP_WAIT_MEM_WRITES, 0);
-    /* MEM_WRITE completion marker at offset 0 */
-    *p++ = CP_TYPE7_PKT(CP_MEM_WRITE, 3);
-    p += cp_gpuaddr(p, result_gpuaddr);
+    /* Address will be filled after mapping */
+    uint32_t *completion_addr_lo = p;
+    uint32_t *completion_addr_hi = p + 1;
+    p += 2;
     *p++ = 0xCAFEBABE;  /* completion marker */
+    /* MEM_WRITE to result_gpuaddr + 0x100 */
+    *p++ = CP_TYPE7_PKT(CP_MEM_WRITE, 3); 
+    uint32_t *target_addr_lo = p;
+    uint32_t *target_addr_hi = p + 1;
+    p += 2;
+    *p++ = 0xDEADBEEF;  /* target value */
+    /* WAIT_MEM_WRITES */
+    *p++ = CP_TYPE7_PKT(CP_WAIT_MEM_WRITES, 0);
     *p++ = CP_TYPE7_PKT(CP_NOP, 0);
-
-    uint32_t cmd_size = (char*)p - (char*)cmd; /* in bytes */
-
-    printf("[*] cmd size=%u bytes (%u dwords)\n", cmd_size, cmd_size/4);
-
-    /* Map command buffer to GPU */
-    uint64_t cmd_gpuaddr = 0;
+    
+    uint32_t cmd_size = (char*)p - (char*)cmd;
+    printf("[*] cmd size=%u bytes\n", cmd_size);
+    
+    /* Map the entire buffer to GPU */
     {
         struct kgsl_map_user_mem m = {
-            .len = 4096, .hostptr = (unsigned long)cmd,
+            .len = 0x8000,
+            .hostptr = (unsigned long)buf,
             .memtype = KGSL_USER_MEM_TYPE_ADDR,
         };
-        if (ioctl(fd, IOCTL_KGSL_MAP_USER_MEM, &m)) {
-            printf("[-] map cmd: %s\n", strerror(errno));
-            goto destroy;
+        int ret = ioctl(fd, IOCTL_KGSL_MAP_USER_MEM, &m);
+        if (ret) {
+            printf("[-] map buf: %s (errno=%d)\n", strerror(errno), errno);
+            goto out2;
         }
-        cmd_gpuaddr = m.gpuaddr;
+        buf_gpuaddr = m.gpuaddr;
+        cmd_gpuaddr = buf_gpuaddr;
+        result_gpuaddr = buf_gpuaddr + 0x1000;
     }
-    printf("[+] cmd mapped: gpuaddr=0x%lx\n", (unsigned long)cmd_gpuaddr);
-
-    /* Sync CPU cache to GPU (important for ARM!) */
-    __builtin___clear_cache((char*)cmd, (char*)cmd + 4096);
-    __builtin___clear_cache((char*)result, (char*)result + 0x10000);
-
-    /* Submit GPU command with timestamp=42 */
+    printf("[+] buf mapped: host=%p gpuaddr=0x%lx\n", buf, (unsigned long)buf_gpuaddr);
+    printf("[+] cmd at 0x%lx, result at 0x%lx\n", (unsigned long)cmd_gpuaddr, (unsigned long)result_gpuaddr);
+    
+    /* Fill in the GPU addresses in the command buffer */
+    *completion_addr_lo = lower_32_bits(result_gpuaddr);
+    *completion_addr_hi = upper_32_bits(result_gpuaddr);
+    *target_addr_lo = lower_32_bits(result_gpuaddr + 0x100);
+    *target_addr_hi = upper_32_bits(result_gpuaddr + 0x100);
+    
+    /* Sync cache */
+    __builtin___clear_cache((char*)buf, (char*)buf + 0x8000);
+    
+    /* Submit GPU command */
     {
         struct kgsl_command_object objs[1] = {{
             .gpuaddr = cmd_gpuaddr,
@@ -182,63 +170,43 @@ int main() {
             .context_id = ctx.drawctxt_id,
             .timestamp = 42,
         };
-        printf("[*] submitting GPU command (ts=42)...\n");
-        if (ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &req)) {
-            printf("[-] gpu_cmd: %s\n", strerror(errno));
-            goto destroy;
+        printf("[*] submitting GPU command...\n");
+        int ret = ioctl(fd, IOCTL_KGSL_GPU_COMMAND, &req);
+        if (ret) {
+            printf("[-] gpu_cmd: %s (errno=%d)\n", strerror(errno), errno);
+            goto out2;
         }
         printf("[+] submitted ts=%u\n", req.timestamp);
     }
-
-    /* Try to wait for timestamp using TIMESTAMP_EVENT ioctl */
-    printf("[*] waiting for GPU completion...\n");
-    {
-        struct kgsl_timestamp_event_retired ev = {
-            .timestamp = 42,
-        };
-        int ret = ioctl(fd, IOCTL_KGSL_TIMESTAMP_EVENT, &ev);
-        if (ret == 0) {
-            printf("[+] TIMESTAMP_EVENT OK (waited for ts=42)\n");
-        } else {
-            printf("[-] TIMESTAMP_EVENT: %s (falling back to polling)\n", strerror(errno));
-            /* Fall back to polling */
-            usleep(500000);
-            usleep(500000);
-        }
-    }
-
-    /* Check result */
-    printf("\n=== Results ===\n");
-    printf("result[0]    = 0x%08x (expected 0xCAFEBABE)\n", result[0]);
-    printf("result[64]   = 0x%08x (expected 0xDEADBEEF)\n", result[0x100/4]);
     
-    if (result[0] == 0xCAFEBABE) {
-        printf("✅ GPU EXECUTED! Both writes confirmed!\n");
-    } else if (result[0x100/4] == 0xDEADBEEF) {
-        printf("⚠️  Partial: GPU wrote marker but not target\n");
-    } else if (result[0] == 0xABABABAB) {
-        printf("❌ GPU did NOT execute. Cache issue or command format wrong.\n");
-        
-        /* Try polling more */
-        printf("[*] polling for 5 more seconds...\n");
-        for (int i = 0; i < 5; i++) {
-            sleep(1);
-            printf("    result[0]=0x%08x result[64]=0x%08x\n", result[0], result[0x100/4]);
-            if (result[0] != 0xABABABAB) {
-                printf("✅ GPU responded!\n");
-                break;
+    /* Poll for completion */
+    printf("[*] polling for completion...\n");
+    volatile uint32_t *result = (volatile uint32_t *)((char*)buf + 0x1000);
+    for (int i = 0; i < 20; i++) {
+        uint32_t marker = result[0];
+        uint32_t target = result[0x100/4];
+        printf("    [%d] marker=0x%08x target=0x%08x\n", i, marker, target);
+        if (marker == 0xCAFEBABE) {
+            printf("✅ GPU EXECUTED! Marker=0xCAFEBABE, target=0x%08x\n", target);
+            if (target == 0xDEADBEEF) {
+                printf("✅ Both writes confirmed! GPU can write to mapped memory!\n");
+            } else {
+                printf("⚠️  Marker OK but target=0x%08x (expected 0xDEADBEEF)\n", target);
             }
+            goto out2;
         }
-    } else {
-        printf("❓ Unexpected value\n");
+        usleep(100000);
     }
+    
+    printf("❌ GPU did not respond after 2 seconds\n");
+    printf("   result[0]=0x%08x result[0x100/4]=0x%08x\n", result[0], result[0x100/4]);
 
-destroy:
+out2:
     {
         struct kgsl_drawctxt_destroy d = { .drawctxt_id = ctx.drawctxt_id };
         ioctl(fd, IOCTL_KGSL_DRAWCTXT_DESTROY, &d);
     }
-out:
+out1:
     close(fd);
     printf("[+] DONE\n");
     return 0;
